@@ -1,0 +1,180 @@
+# ============================================================
+# Advanced Multivariate Time Series Forecasting
+# LSTM vs Transformer (Attention) vs SARIMAX
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+import warnings
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# Reproducibility
+# ============================================================
+np.random.seed(42)
+tf.random.set_seed(42)
+
+# ============================================================
+# 1. Dataset Generation
+# ============================================================
+def generate_data(n_steps=1500):
+    t = np.arange(n_steps)
+    energy = 0.03*t + 8*np.sin(2*np.pi*t/24) + np.random.normal(0, 0.8, n_steps)
+    temp = 22 + 4*np.sin(2*np.pi*t/365) + np.random.normal(0, 0.4, n_steps)
+    humidity = 55 + 12*np.sin(2*np.pi*t/168) + np.random.normal(0, 1.5, n_steps)
+    return pd.DataFrame({
+        "energy": energy,
+        "temperature": temp,
+        "humidity": humidity
+    })
+
+data = generate_data()
+
+# ============================================================
+# 2. Scaling
+# ============================================================
+scaler = MinMaxScaler()
+scaled = scaler.fit_transform(data)
+
+# ============================================================
+# 3. Sequence Generator (Multi-Horizon)
+# ============================================================
+def create_sequences(data, window, horizon):
+    X, y = [], []
+    for i in range(len(data) - window - horizon):
+        X.append(data[i:i+window])
+        y.append(data[i+window:i+window+horizon, 0])
+    return np.array(X), np.array(y)
+
+WINDOW = 48
+HORIZONS = [1, 5, 10]
+
+# ============================================================
+# 4. Positional Encoding
+# ============================================================
+class PositionalEncoding(layers.Layer):
+    def __init__(self, seq_len, d_model):
+        super().__init__()
+        pos = np.arange(seq_len)[:, np.newaxis]
+        i = np.arange(d_model)[np.newaxis, :]
+        angle_rates = 1 / np.power(10000, (2 * (i//2)) / np.float32(d_model))
+        angle_rads = pos * angle_rates
+        pe = np.zeros((seq_len, d_model))
+        pe[:, 0::2] = np.sin(angle_rads[:, 0::2])
+        pe[:, 1::2] = np.cos(angle_rads[:, 1::2])
+        self.pe = tf.constant(pe[np.newaxis, ...], dtype=tf.float32)
+
+    def call(self, x):
+        return x + self.pe[:, :tf.shape(x)[1], :]
+
+# ============================================================
+# 5. Transformer Encoder Block
+# ============================================================
+class TransformerBlock(layers.Layer):
+    def __init__(self, embed_dim, heads, ff_dim):
+        super().__init__()
+        self.att = layers.MultiHeadAttention(num_heads=heads, key_dim=embed_dim)
+        self.ffn = models.Sequential([
+            layers.Dense(ff_dim, activation="relu"),
+            layers.Dense(embed_dim)
+        ])
+        self.norm1 = layers.LayerNormalization()
+        self.norm2 = layers.LayerNormalization()
+        self.drop1 = layers.Dropout(0.1)
+        self.drop2 = layers.Dropout(0.1)
+
+    def call(self, x):
+        attn = self.att(x, x)
+        x = self.norm1(x + self.drop1(attn))
+        ffn = self.ffn(x)
+        return self.norm2(x + self.drop2(ffn))
+
+# ============================================================
+# 6. Transformer Model Builder
+# ============================================================
+def build_transformer(window, features, horizon):
+    inputs = layers.Input(shape=(window, features))
+    x = layers.Dense(64)(inputs)
+    x = PositionalEncoding(window, 64)(x)
+
+    for _ in range(2):
+        x = TransformerBlock(64, 4, 128)(x)
+
+    x = layers.GlobalAveragePooling1D()(x)
+    outputs = layers.Dense(horizon)(x)
+    model = models.Model(inputs, outputs)
+    model.compile(optimizer="adam", loss="mse")
+    return model
+
+# ============================================================
+# 7. LSTM Baseline
+# ============================================================
+def build_lstm(window, features, horizon):
+    model = models.Sequential([
+        layers.LSTM(64, return_sequences=True, input_shape=(window, features)),
+        layers.LSTM(32),
+        layers.Dense(horizon)
+    ])
+    model.compile(optimizer="adam", loss="mse")
+    return model
+
+# ============================================================
+# 8. Evaluation Function
+# ============================================================
+def evaluate(y_true, y_pred):
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mae = mean_absolute_error(y_true, y_pred)
+    mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+    return rmse, mae, mape
+
+# ============================================================
+# 9. Experiments (1, 5, 10 step)
+# ============================================================
+results = []
+
+for horizon in HORIZONS:
+    X, y = create_sequences(scaled, WINDOW, horizon)
+    split = int(0.8 * len(X))
+    X_train, X_test = X[:split], X[split:]
+    y_train, y_test = y[:split], y[split:]
+
+    # LSTM
+    lstm = build_lstm(WINDOW, 3, horizon)
+    lstm.fit(X_train, y_train, epochs=10, batch_size=32, verbose=0)
+    lstm_pred = lstm.predict(X_test)
+
+    # Transformer
+    transformer = build_transformer(WINDOW, 3, horizon)
+    transformer.fit(X_train, y_train, epochs=15, batch_size=32, verbose=0)
+    trans_pred = transformer.predict(X_test)
+
+    # SARIMAX (1-step baseline only)
+    sarimax = SARIMAX(data["energy"][:split], order=(2,1,2),
+                      seasonal_order=(1,1,1,24)).fit(disp=False)
+    sar_pred = sarimax.forecast(len(y_test))
+
+    results.append([
+        horizon,
+        *evaluate(y_test[:,0], lstm_pred[:,0]),
+        *evaluate(y_test[:,0], trans_pred[:,0]),
+        *evaluate(y_test[:,0], sar_pred)
+    ])
+
+# ============================================================
+# 10. Results Table
+# ============================================================
+columns = [
+    "Horizon",
+    "LSTM_RMSE", "LSTM_MAE", "LSTM_MAPE",
+    "Transformer_RMSE", "Transformer_MAE", "Transformer_MAPE",
+    "SARIMAX_RMSE", "SARIMAX_MAE", "SARIMAX_MAPE"
+]
+
+results_df = pd.DataFrame(results, columns=columns)
+print("\n=== Final Evaluation Results ===")
+print(results_df)
